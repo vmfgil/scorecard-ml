@@ -96,12 +96,8 @@ def monotonic_binning(df, var, target, max_bins=5):
             if has_event and large_enough and (is_increasing or is_decreasing):
                 return df[f'{var}_bins']
             
-            # Debug silencioso para saber porque falhou este bin
-            # if not is_increasing and not is_decreasing: print(f"DEBUG: {var} falhou monotonicidade com {n_bins} bins.")
-            
             n_bins -= 1
         except Exception as e:
-            # print(f"DEBUG: Erro no binning de {var}: {e}")
             n_bins -= 1
     return None
 
@@ -165,7 +161,8 @@ if 'iv_tables' not in st.session_state: st.session_state.iv_tables = {}
 
 keys_report = ['report_dq', 'report_split', 'report_uni', 'report_multi', 'report_ml', 
                'final_model_data', 'report_dq_missings', 'report_multi_details', 'roc_curves', 
-               'report_iv', 'report_binning_fail', 'ks_curves', 'uni_summary', 'X_test_final', 'y_test_final']
+               'report_iv', 'report_binning_fail', 'ks_curves', 'uni_summary', 'X_test_final', 'y_test_final',
+               'stats_dq', 'stats_uni', 'stats_multi', 'stats_cat']
 
 for key in keys_report:
     if key not in st.session_state: st.session_state[key] = None
@@ -186,7 +183,8 @@ if not st.session_state.logged_in:
 else:
     # --- SIDEBAR ---
     st.sidebar.title("🚀 Menu Principal")
-    menu = st.sidebar.radio("Ir para:", ["🏠 Início", "📁 Upload de Dados", "⚙️ Modelização", "📊 Resultados Finais", "📑 Relatório Intermédio"])
+    # ALTERAÇÃO: Nome do Menu
+    menu = st.sidebar.radio("Ir para:", ["🏠 Início", "📁 Upload de Dados", "⚙️ Modelização", "📊 Resultados Finais", "📑 Relatório Técnico"])
     if st.sidebar.button("Sair"):
         st.session_state.logged_in = False
         st.rerun()
@@ -259,11 +257,12 @@ else:
                     target_col = st.session_state.target
                     feature_cols = sorted(list(set([c for c in st.session_state.features if c != target_col])))
                     
+                    initial_count = len(feature_cols)
                     log_dq = []
                     
                     # --- a) DATA QUALITY ---
                     st.write("🧹 Executando Data Quality...")
-                    log_message(f"Total Variáveis Iniciais: {len(feature_cols)}")
+                    log_message(f"Total Variáveis Iniciais: {initial_count}")
                     
                     df_work.replace(r'^\s*$', np.nan, regex=True, inplace=True)
                     
@@ -281,7 +280,6 @@ else:
                             conv = pd.to_numeric(df_work[col], errors='coerce')
                             if conv.notnull().mean() <= 0.5:
                                 try:
-                                    # Limpeza extra para moedas/percentagens
                                     clean = df_work[col].astype(str).str.replace(r'[€%\s]', '', regex=True).str.replace(',', '')
                                     conv = pd.to_numeric(clean, errors='coerce')
                                 except: pass
@@ -294,10 +292,15 @@ else:
                     if drop: log_message(f"DQ: Eliminadas por Missing > 20%: {drop}")
                     feature_cols = [c for c in feature_cols if c not in drop]
                     
+                    # ALTERAÇÃO: Guardar estatísticas DQ
+                    st.session_state.stats_dq = {
+                        "Entrada": initial_count,
+                        "Eliminadas": len(drop),
+                        "Saída": len(feature_cols)
+                    }
+                    
                     num_cols = df_work[feature_cols].select_dtypes(include=[np.number]).columns.tolist()
                     cat_cols = df_work[feature_cols].select_dtypes(exclude=[np.number]).columns.tolist()
-                    
-                    log_message(f"DQ Stats: {len(num_cols)} Numéricas, {len(cat_cols)} Categóricas.")
                     
                     if num_cols:
                         for idx, col in enumerate(num_cols):
@@ -317,12 +320,22 @@ else:
                     st.write("✂️ Split...")
                     train, test = train_test_split(df_work, test_size=0.3, stratify=df_work[target_col], random_state=42)
                     
+                    split_stats = pd.DataFrame({
+                        'Amostra': ['Treino', 'Teste', 'Total'],
+                        'Registos': [len(train), len(test), len(df_work)],
+                        'Eventos': [train[target_col].sum(), test[target_col].sum(), df_work[target_col].sum()],
+                        'Taxa Evento': [train[target_col].mean(), test[target_col].mean(), df_work[target_col].mean()]
+                    })
+                    st.session_state.report_split = split_stats # Guardar no estado para usar depois
+
                     # --- c) UNIVARIADA ---
                     st.write("🔬 Univariada...")
                     log_message("A iniciar Análise Univariada...")
                     uni_res = []
                     keep_uni = []
                     samp = train.sample(20000, random_state=42) if len(train) > 20000 else train
+                    
+                    count_uni_in = len(feature_cols)
                     
                     for idx, col in enumerate(feature_cols):
                         try:
@@ -347,12 +360,19 @@ else:
                             log_message(f"Univariada: Eliminada '{col}' (p={p:.4f})")
                     
                     st.session_state.report_uni = pd.DataFrame(uni_res)
-                    log_message(f"Pós-Univariada: Restam {len(keep_uni)} variáveis.")
+                    
+                    # ALTERAÇÃO: Guardar estatísticas Univariada
+                    st.session_state.stats_uni = {
+                        "Entrada": count_uni_in,
+                        "Eliminadas": count_uni_in - len(keep_uni),
+                        "Saída": len(keep_uni)
+                    }
 
                     # --- d) MULTIVARIADA ---
                     st.write("🕸️ Multivariada...")
                     num_k = [f for f in keep_uni if f in num_cols]
                     drop_multi = set()
+                    multi_details = [] # Inicializar lista para guardar detalhes
                     
                     if len(num_k) > 1:
                         corr = train[num_k].sample(50000).corr().abs() if len(train)>50000 else train[num_k].corr().abs()
@@ -365,16 +385,41 @@ else:
                                 try:
                                     tau1, _ = stats.kendalltau(train[c1].fillna(-999), train[target_col])
                                     tau2, _ = stats.kendalltau(train[c2].fillna(-999), train[target_col])
+                                    val_corr = corr.iloc[i, j] # Guardar valor correlação
                                     
                                     if abs(tau1) < abs(tau2): 
-                                        drop_multi.add(c1)
+                                        elim, keeper = c1, c2
+                                        k_elim, k_keep = tau1, tau2
                                     else: 
-                                        drop_multi.add(c2)
+                                        elim, keeper = c2, c1
+                                        k_elim, k_keep = tau2, tau1
+                                        
+                                    drop_multi.add(elim)
+                                    # ALTERAÇÃO: Preencher tabela de detalhes
+                                    multi_details.append({
+                                        "Eliminada": elim, 
+                                        "Mantida (Killer)": keeper, 
+                                        "Correlação": val_corr,
+                                        "Kendall Eliminada": round(k_elim, 4),
+                                        "Kendall Mantida": round(k_keep, 4)
+                                    })
                                 except: pass
                     
                     final_feats = [f for f in keep_uni if f not in drop_multi]
                     st.session_state.report_multi = list(drop_multi)
-                    if drop_multi: log_message(f"Multivariada: Eliminadas {len(drop_multi)} por correlação.")
+                    
+                    # ALTERAÇÃO: Guardar DataFrame com detalhes da eliminação
+                    if multi_details:
+                        st.session_state.report_multi_details = pd.DataFrame(multi_details).drop_duplicates(subset=['Eliminada'])
+                    else:
+                        st.session_state.report_multi_details = pd.DataFrame(columns=["Eliminada", "Mantida (Killer)", "Correlação", "Kendall Eliminada", "Kendall Mantida"])
+
+                    # ALTERAÇÃO: Guardar estatísticas Multivariada
+                    st.session_state.stats_multi = {
+                        "Entrada": len(keep_uni),
+                        "Eliminadas": len(drop_multi),
+                        "Saída": len(final_feats)
+                    }
 
                     # --- e) BINNING & CATEGORIZATION ---
                     st.write("📦 Binning & IV...")
@@ -384,6 +429,8 @@ else:
                     binning_fail = []
                     iv_report = []
                     iv_tables_dict = {}
+                    
+                    count_cat_in = len(final_feats)
                     
                     for idx, col in enumerate(final_feats):
                         is_num = col in num_cols
@@ -418,17 +465,20 @@ else:
                             binning_fail.append(col)
                             log_message(f"Binning Falhou (1 Bin): {col}")
 
-                    # --- SAFETY CHECK PARA EVITAR CRASH ---
                     if not iv_report:
                         st.error("ERRO CRÍTICO: Nenhuma variável sobreviveu ao Binning Monotónico.")
-                        st.write("Diagnóstico:")
-                        st.write(f"- Variáveis tentadas: {len(final_feats)}")
-                        st.write(f"- Falhas: {len(binning_fail)}")
                         st.stop()
 
                     st.session_state.report_iv = pd.DataFrame(iv_report).sort_values('IV', ascending=False)
                     st.session_state.report_binning_fail = binning_fail
                     st.session_state.iv_tables = iv_tables_dict
+                    
+                    # ALTERAÇÃO: Guardar estatísticas Categorização
+                    st.session_state.stats_cat = {
+                        "Entrada": count_cat_in,
+                        "Eliminadas": len(binning_fail),
+                        "Saída": len(proc_feats)
+                    }
                     
                     log_message(f"Fase Final: {len(proc_feats)} variáveis prontas para modelização.")
 
@@ -468,7 +518,6 @@ else:
                     for name, m in models_def.items():
                         log_message(f"Processando: {name}")
                         
-                        # -- PREP DADOS (SCALING LOGREG) --
                         if name == "LogReg":
                             scaler = StandardScaler()
                             X_train_model = pd.DataFrame(scaler.fit_transform(X_tr_all), columns=X_tr_all.columns, index=X_tr_all.index)
@@ -477,7 +526,6 @@ else:
                             X_train_model = X_tr_all
                             X_test_model = X_te_all
                         
-                        # -- 1. SELEÇÃO (MÉDIA DUMMIES) --
                         m.fit(X_train_model, y_tr)
                         
                         if name == "LogReg": raw_importances = np.abs(m.coef_[0])
@@ -500,7 +548,6 @@ else:
                         selected_vars = sorted_vars[:num_vars_limit]
                         log_message(f"Vars Finais ({name}): {selected_vars}")
                         
-                        # -- 2. TREINO FINAL --
                         final_dummies = []
                         for col in X_train_model.columns:
                             for v in selected_vars:
@@ -523,7 +570,6 @@ else:
                         ks_data[name] = df_ks
                         res_ml.append({"Algoritmo": name, "ROC AUC": round(auc,3), "KS": round(ks,1)})
                         
-                        # -- 3. SCORECARD --
                         sc_rows = []
                         if name == "LogReg":
                             coef_df = pd.DataFrame({'Dummy': X_tr_fin.columns, 'Coef': m.coef_[0]})
@@ -555,7 +601,6 @@ else:
                         
                         df_sc, weights = scale_scorecard(pd.DataFrame(sc_rows))
                         
-                        # -- 4. SCORING --
                         df_scored = total_b.copy()
                         df_scored['TotalScore'] = 0
                         pmap = df_sc.set_index(['Variável', 'Categoria'])['Pontos'].to_dict()
@@ -574,19 +619,10 @@ else:
                                 X_total_model[c] = temp_dummies[c].values
 
                         if name == "LogReg":
-                            # Criar um scaler NOVO apenas para as colunas finais
-                            # Usamos as colunas correspondentes do dataset total original (antes de filtrar)
                             final_scaler_total = StandardScaler()
-                            # Precisamos de ajustar aos dados totais correspondentes a estas colunas
-                            subset_data = total_b[selected_vars] # Variáveis originais (sem dummies)
-                            # Mas espera, X_total_model já são dummies. 
-                            # O correto é ajustar aos DADOS DE TREINO FINAIS (X_tr_fin) que o modelo viu
-                            
-                            final_scaler_total.fit(X_tr_fin) # Aprende a escala do treino final (14 vars)
+                            final_scaler_total.fit(X_tr_fin)
                             X_total_model = pd.DataFrame(final_scaler_total.transform(X_total_model), columns=final_dummies)
-
-
-
+                        
                         ptotal = m.predict_proba(X_total_model)[:,1]
                         
                         model_data_dict[name] = {
@@ -676,7 +712,7 @@ else:
                     mime='text/csv',
                 )
 
-    elif menu == "📑 Relatório Intermédio":
+    elif menu == "📑 Relatório Técnico":
         st.title("Relatório Técnico")
         if not st.session_state.model_ready:
             st.info("Corra o modelo para gerar o relatório.")
@@ -686,6 +722,13 @@ else:
             )
             
             with tab_dq:
+                # ALTERAÇÃO: Sumário DQ
+                st_dq = st.session_state.stats_dq
+                if st_dq:
+                    col_d1, col_d2, col_d3 = st.columns(3)
+                    col_d1.metric("Variáveis Iniciais", st_dq["Entrada"])
+                    col_d2.metric("Eliminadas (>20% missings)", st_dq["Eliminadas"])
+                    col_d3.metric("Restantes", st_dq["Saída"])
                 st.write("Estado das variáveis quanto a Missings (>20%):")
                 st.dataframe(st.session_state.report_dq_missings.style.apply(lambda x: ['background: #ffcccc' if v == 'Eliminar' else '' for v in x], axis=1), use_container_width=True)
             
@@ -693,22 +736,47 @@ else:
                 st.table(st.session_state.report_split)
             
             with tab_uni:
+                # ALTERAÇÃO: Sumário Univariada
+                st_uni = st.session_state.stats_uni
+                if st_uni:
+                    col_u1, col_u2, col_u3 = st.columns(3)
+                    col_u1.metric("Variáveis Testadas", st_uni["Entrada"])
+                    col_u2.metric("Eliminadas (p-value > 0.05)", st_uni["Eliminadas"])
+                    col_u3.metric("Restantes", st_uni["Saída"])
                 st.dataframe(st.session_state.report_uni.style.apply(lambda x: ['background: #ffcccc' if v == 'Eliminar' else '' for v in x], axis=1), use_container_width=True)
             
             with tab_multi:
+                # ALTERAÇÃO: Sumário Multivariada
+                st_mul = st.session_state.stats_multi
+                if st_mul:
+                    col_m1, col_m2, col_m3 = st.columns(3)
+                    col_m1.metric("Candidatas", st_mul["Entrada"])
+                    col_m2.metric("Eliminadas (Correlação > 0.8)", st_mul["Eliminadas"])
+                    col_m3.metric("Finais", st_mul["Saída"])
+                
                 st.write("Matriz de Correlação:")
                 if 'corr_matrix' in st.session_state and st.session_state.corr_matrix is not None:
+                    # ALTERAÇÃO: Altura da Matriz
                     fig_corr = go.Figure(data=go.Heatmap(
                         z=st.session_state.corr_matrix.values,
                         x=st.session_state.corr_matrix.columns,
                         y=st.session_state.corr_matrix.index,
                         colorscale='Viridis'))
+                    fig_corr.update_layout(height=800)
                     st.plotly_chart(fig_corr)
                 st.divider()
                 st.write("Variáveis Eliminadas por Correlação (Critério: Kendall Tau):")
                 st.dataframe(st.session_state.report_multi_details, use_container_width=True)
             
             with tab_cat:
+                # ALTERAÇÃO: Sumário Categorização
+                st_cat = st.session_state.stats_cat
+                if st_cat:
+                    col_c1, col_c2, col_c3 = st.columns(3)
+                    col_c1.metric("Tentativa Binning", st_cat["Entrada"])
+                    col_c2.metric("Falharam (Monotonicidade/Size)", st_cat["Eliminadas"])
+                    col_c3.metric("Variáveis Finais", st_cat["Saída"])
+                
                 st.header("Variáveis Finais (IV e Bins)")
                 st.dataframe(st.session_state.report_iv, use_container_width=True)
                 st.divider()
