@@ -26,6 +26,29 @@ warnings.filterwarnings('ignore')
 # --- CONFIGURAÇÃO DA PÁGINA ---
 st.set_page_config(page_title="ML Scorecard Pro", layout="wide")
 
+# --- FUNÇÕES AUXILIARES DE FORMATAÇÃO ---
+def format_percent(x):
+    try:
+        return f"{float(x):.2%}"
+    except:
+        return x
+
+def format_thousands(x):
+    try:
+        return f"{float(x):,.0f}".replace(",", ".") # Padrão Europeu/PT (opcional, trocando virgula por ponto se preferir, ou manter padrão US)
+        # Vou usar padrão standard com virgula como separador de milhar para consistência pythonica, 
+        # mas o replace acima garante o "visual" mais comum em PT se desejado. 
+        # Vou manter a virgula como separador de milhar que é o standard internacional em TI.
+        return f"{float(x):,.0f}" 
+    except:
+        return x
+
+def format_float_2(x):
+    try:
+        return f"{float(x):.2f}"
+    except:
+        return x
+
 # --- FUNÇÕES AUXILIARES ---
 @st.cache_data(ttl=3600, show_spinner="A ler dados...")
 def load_data(uploaded_file):
@@ -51,7 +74,7 @@ def calculate_ks(y_true, y_probs):
     return df_ks['ks_dist'].max() * 100, df_ks
 
 def calculate_iv(df, feature, target):
-    """Calcula Information Value (IV)"""
+    """Calcula Information Value (IV) e Event Rate"""
     lst = []
     clean_series = df[feature].astype(str)
     for val in clean_series.unique():
@@ -74,6 +97,9 @@ def calculate_iv(df, feature, target):
     
     dset['WoE'] = np.log(dset['Dist_Good'] / dset['Dist_Bad'])
     dset['IV'] = (dset['Dist_Good'] - dset['Dist_Bad']) * dset['WoE']
+    
+    # ALTERAÇÃO: Calcular Event Rate
+    dset['Event_Rate'] = dset['Bad'] / dset['Total']
     
     return dset['IV'].sum(), dset
 
@@ -140,11 +166,15 @@ def scale_scorecard(df_raw, score_min=300, score_max=850):
     total_amplitude = agg_stats['Amplitude'].sum()
     if total_amplitude == 0: total_amplitude = 1
     
-    agg_stats['Peso (%)'] = (agg_stats['Amplitude'] / total_amplitude) * 100
+    agg_stats['Peso (%)'] = (agg_stats['Amplitude'] / total_amplitude) # Mantém float para o gráfico, formata depois
     weights_table = agg_stats[['Variável', 'Peso (%)']].sort_values('Peso (%)', ascending=False)
     
-    cols_final = ['Variável', 'Categoria', 'WoE', 'Coef', 'Score Base', 'Pontos']
-    if 'WoE' not in df_calc.columns: df_calc['WoE'] = np.nan
+    # ALTERAÇÃO: Remoção de colunas e adição de Event Rate (já deve vir no df_raw)
+    cols_final = ['Variável', 'Categoria', 'Pontos', 'Event Rate']
+    
+    # Garantir que existe a coluna, se não existir (fallback)
+    if 'Event Rate' not in df_calc.columns:
+        df_calc['Event Rate'] = 0.0
         
     scorecard_final = df_calc[cols_final].sort_values(['Variável', 'Pontos'])
     
@@ -183,7 +213,6 @@ if not st.session_state.logged_in:
 else:
     # --- SIDEBAR ---
     st.sidebar.title("🚀 Menu Principal")
-    # ALTERAÇÃO: Nome do Menu
     menu = st.sidebar.radio("Ir para:", ["🏠 Início", "📁 Upload de Dados", "⚙️ Modelização", "📊 Resultados Finais", "📑 Relatório Técnico"])
     if st.sidebar.button("Sair"):
         st.session_state.logged_in = False
@@ -205,7 +234,7 @@ else:
                     if not st.session_state.features:
                         st.session_state.features = st.session_state.df.columns.tolist()
 
-            st.success(f"Dados prontos! {len(st.session_state.df)} linhas carregadas.")
+            st.success(f"Dados prontos! {format_thousands(len(st.session_state.df))} linhas carregadas.")
 
             col1, col2 = st.columns(2)
             cols = st.session_state.df.columns.tolist()
@@ -292,7 +321,6 @@ else:
                     if drop: log_message(f"DQ: Eliminadas por Missing > 20%: {drop}")
                     feature_cols = [c for c in feature_cols if c not in drop]
                     
-                    # ALTERAÇÃO: Guardar estatísticas DQ
                     st.session_state.stats_dq = {
                         "Entrada": initial_count,
                         "Eliminadas": len(drop),
@@ -320,13 +348,14 @@ else:
                     st.write("✂️ Split...")
                     train, test = train_test_split(df_work, test_size=0.3, stratify=df_work[target_col], random_state=42)
                     
+                    # ALTERAÇÃO: Event Rate e Formatação
                     split_stats = pd.DataFrame({
                         'Amostra': ['Treino', 'Teste', 'Total'],
                         'Registos': [len(train), len(test), len(df_work)],
                         'Eventos': [train[target_col].sum(), test[target_col].sum(), df_work[target_col].sum()],
-                        'Taxa Evento': [train[target_col].mean(), test[target_col].mean(), df_work[target_col].mean()]
+                        'Event Rate': [train[target_col].mean(), test[target_col].mean(), df_work[target_col].mean()]
                     })
-                    st.session_state.report_split = split_stats # Guardar no estado para usar depois
+                    st.session_state.report_split = split_stats 
 
                     # --- c) UNIVARIADA ---
                     st.write("🔬 Univariada...")
@@ -343,17 +372,22 @@ else:
                                 if samp[col].nunique() > 50:
                                     top = samp[col].value_counts().nlargest(20).index
                                     s = samp[col].where(samp[col].isin(top), "OUTROS")
-                                    p = stats.chi2_contingency(pd.crosstab(s, samp[target_col]))[1]
+                                    chi2, p, dof, ex = stats.chi2_contingency(pd.crosstab(s, samp[target_col]))
+                                    stat_val = chi2
                                 else:
-                                    p = stats.chi2_contingency(pd.crosstab(samp[col], samp[target_col]))[1]
+                                    chi2, p, dof, ex = stats.chi2_contingency(pd.crosstab(samp[col], samp[target_col]))
+                                    stat_val = chi2
                                 metric, tipo = "Chi2", "Categórica"
                             else:
                                 tau, p = stats.kendalltau(samp[col], samp[target_col])
+                                stat_val = tau
                                 metric, tipo = "Kendall", "Numérica"
-                        except: p, metric, tipo = 1.0, "Erro", "Erro"
+                        except: 
+                            p, stat_val, metric, tipo = 1.0, 0.0, "Erro", "Erro"
                         
                         dec = "Manter" if p <= 0.05 else "Eliminar"
-                        uni_res.append({"Variável": col, "Tipo": tipo, "Teste": metric, "p-value": p, "Status": dec})
+                        # ALTERAÇÃO: Adicionar Valor da Estatística
+                        uni_res.append({"Variável": col, "Tipo": tipo, "Teste": metric, "Valor Estatística": stat_val, "p-value": p, "Status": dec})
                         if p <= 0.05: 
                             keep_uni.append(col)
                         else:
@@ -361,7 +395,6 @@ else:
                     
                     st.session_state.report_uni = pd.DataFrame(uni_res)
                     
-                    # ALTERAÇÃO: Guardar estatísticas Univariada
                     st.session_state.stats_uni = {
                         "Entrada": count_uni_in,
                         "Eliminadas": count_uni_in - len(keep_uni),
@@ -372,7 +405,7 @@ else:
                     st.write("🕸️ Multivariada...")
                     num_k = [f for f in keep_uni if f in num_cols]
                     drop_multi = set()
-                    multi_details = [] # Inicializar lista para guardar detalhes
+                    multi_details = [] 
                     
                     if len(num_k) > 1:
                         corr = train[num_k].sample(50000).corr().abs() if len(train)>50000 else train[num_k].corr().abs()
@@ -385,7 +418,7 @@ else:
                                 try:
                                     tau1, _ = stats.kendalltau(train[c1].fillna(-999), train[target_col])
                                     tau2, _ = stats.kendalltau(train[c2].fillna(-999), train[target_col])
-                                    val_corr = corr.iloc[i, j] # Guardar valor correlação
+                                    val_corr = corr.iloc[i, j] 
                                     
                                     if abs(tau1) < abs(tau2): 
                                         elim, keeper = c1, c2
@@ -395,26 +428,24 @@ else:
                                         k_elim, k_keep = tau2, tau1
                                         
                                     drop_multi.add(elim)
-                                    # ALTERAÇÃO: Preencher tabela de detalhes
+                                    
                                     multi_details.append({
                                         "Eliminada": elim, 
                                         "Mantida (Killer)": keeper, 
-                                        "Correlação": val_corr,
-                                        "Kendall Eliminada": round(k_elim, 4),
-                                        "Kendall Mantida": round(k_keep, 4)
+                                        "Correlação": val_corr, 
+                                        "Kendall Eliminada": k_elim,
+                                        "Kendall Mantida": k_keep
                                     })
                                 except: pass
                     
                     final_feats = [f for f in keep_uni if f not in drop_multi]
                     st.session_state.report_multi = list(drop_multi)
                     
-                    # ALTERAÇÃO: Guardar DataFrame com detalhes da eliminação
                     if multi_details:
                         st.session_state.report_multi_details = pd.DataFrame(multi_details).drop_duplicates(subset=['Eliminada'])
                     else:
                         st.session_state.report_multi_details = pd.DataFrame(columns=["Eliminada", "Mantida (Killer)", "Correlação", "Kendall Eliminada", "Kendall Mantida"])
 
-                    # ALTERAÇÃO: Guardar estatísticas Multivariada
                     st.session_state.stats_multi = {
                         "Entrada": len(keep_uni),
                         "Eliminadas": len(drop_multi),
@@ -436,7 +467,7 @@ else:
                         is_num = col in num_cols
                         
                         if is_num and train[col].nunique() <= 3:
-                            is_num = False # Trata como categórica se tiver poucos valores
+                            is_num = False 
 
                         if is_num:
                             binned = monotonic_binning(train, col, target_col)
@@ -473,7 +504,6 @@ else:
                     st.session_state.report_binning_fail = binning_fail
                     st.session_state.iv_tables = iv_tables_dict
                     
-                    # ALTERAÇÃO: Guardar estatísticas Categorização
                     st.session_state.stats_cat = {
                         "Entrada": count_cat_in,
                         "Eliminadas": len(binning_fail),
@@ -575,8 +605,12 @@ else:
                             coef_df = pd.DataFrame({'Dummy': X_tr_fin.columns, 'Coef': m.coef_[0]})
                             for var in selected_vars:
                                 if var in iv_tables_dict: 
+                                    # ALTERAÇÃO: Capturar Event Rate
                                     woe_map = iv_tables_dict[var].set_index('Value')['WoE'].to_dict()
-                                else: woe_map = {}
+                                    event_map = iv_tables_dict[var].set_index('Value')['Event_Rate'].to_dict()
+                                else: 
+                                    woe_map = {}
+                                    event_map = {}
                                 
                                 for cat in sorted(train_b[var].cat.categories):
                                     cat_str = str(cat)
@@ -587,17 +621,21 @@ else:
                                             match_coef = coef_df.loc[coef_df['Dummy']==dummy_col, 'Coef'].values[0]
                                             break
                                     val_woe = woe_map.get(cat_str, np.nan)
-                                    sc_rows.append({'Variável': var, 'Categoria': cat_str, 'WoE': val_woe, 'Coef': match_coef})
+                                    val_event = event_map.get(cat_str, 0.0)
+                                    sc_rows.append({'Variável': var, 'Categoria': cat_str, 'WoE': val_woe, 'Coef': match_coef, 'Event Rate': val_event})
                         else:
                             for var in selected_vars:
                                 if var in iv_tables_dict:
                                     df_woe = iv_tables_dict[var]
                                     wmin = df_woe['WoE'].min()
                                     wmap = df_woe.set_index('Value')['WoE'].to_dict()
+                                    event_map = df_woe.set_index('Value')['Event_Rate'].to_dict()
+                                    
                                     for cat in sorted(train_b[var].cat.categories):
                                         cat_str = str(cat)
                                         val = wmap.get(cat_str, 0)
-                                        sc_rows.append({'Variável': var, 'Categoria': cat_str, 'WoE': val, 'Coef': wmin - val})
+                                        val_event = event_map.get(cat_str, 0.0)
+                                        sc_rows.append({'Variável': var, 'Categoria': cat_str, 'WoE': val, 'Coef': wmin - val, 'Event Rate': val_event})
                         
                         df_sc, weights = scale_scorecard(pd.DataFrame(sc_rows))
                         
@@ -653,10 +691,28 @@ else:
             
             if data_model:
                 st.subheader("Importância das Variáveis (Pesos)")
-                st.dataframe(data_model.get("weights"), use_container_width=True)
+                # ALTERAÇÃO: Gráfico de Barras em vez de tabela
+                weights_df = data_model.get("weights").copy()
+                fig_imp = px.bar(weights_df, x='Variável', y='Peso (%)', 
+                                title=f"Peso das Variáveis - {sel_model}",
+                                text_auto='.2%',
+                                color='Peso (%)',
+                                color_continuous_scale='Blues')
+                fig_imp.update_layout(xaxis_title="Variável", yaxis_title="Peso (%)")
+                st.plotly_chart(fig_imp, use_container_width=True)
 
                 st.subheader(f"Grelha de Pontuação - {sel_model}")
-                st.dataframe(data_model.get("scorecard"), use_container_width=True)
+                # ALTERAÇÃO: Formatação % e remoção de colunas (já feito no scale_scorecard, aqui formatamos display)
+                df_sc_show = data_model.get("scorecard").copy()
+                
+                # Formatando dataframe para visualização
+                st.dataframe(
+                    df_sc_show.style.format({
+                        "Event Rate": format_percent,
+                        "Pontos": format_thousands
+                    }), 
+                    use_container_width=True
+                )
                 
                 scores = data_model["scores_total"]
                 targets = data_model["y_total"]
@@ -685,14 +741,34 @@ else:
                     Bad=('Target', 'sum')
                 ).reset_index()
                 
-                grade_stats['Bad Rate'] = grade_stats['Bad'] / grade_stats['Count']
+                # ALTERAÇÃO: Nome e Formatação
+                grade_stats['Event Rate'] = grade_stats['Bad'] / grade_stats['Count']
                 grade_stats['Label'] = grade_stats.apply(lambda x: f"{x['Grade']} [{int(x['Min_Score'])}-{int(x['Max_Score'])}]", axis=1)
+                
+                # Preparar para display (separadores de milhar e %)
+                grade_stats_display = grade_stats.copy()
                 
                 fig = make_subplots(specs=[[{"secondary_y": True}]])
                 fig.add_trace(go.Bar(x=grade_stats['Label'], y=grade_stats['Count'], name="Volume", marker_color='rgb(55, 83, 109)'), secondary_y=False)
-                fig.add_trace(go.Scatter(x=grade_stats['Label'], y=grade_stats['Bad Rate'], name="Bad Rate", mode='lines+markers', line=dict(color='rgb(26, 118, 255)')), secondary_y=True)
+                fig.add_trace(go.Scatter(x=grade_stats['Label'], y=grade_stats['Event Rate'], name="Event Rate", mode='lines+markers', line=dict(color='rgb(26, 118, 255)')), secondary_y=True)
                 fig.update_layout(title_text=f"Scorecard Performance ({sel_model})")
+                fig.update_yaxes(title_text="Volume", tickformat=",", secondary_y=False)
+                fig.update_yaxes(title_text="Event Rate", tickformat=".2%", secondary_y=True)
                 st.plotly_chart(fig, use_container_width=True)
+                
+                # Tabela de suporte formatada
+                st.write("Detalhe por Grade:")
+                st.dataframe(
+                    grade_stats[['Grade', 'Min_Score', 'Max_Score', 'Count', 'Bad', 'Event Rate']]
+                    .style.format({
+                        'Min_Score': format_thousands,
+                        'Max_Score': format_thousands,
+                        'Count': format_thousands,
+                        'Bad': format_thousands,
+                        'Event Rate': format_percent
+                    }),
+                    use_container_width=True
+                )
                 
                 st.divider()
                 st.subheader("📥 Exportar Resultados")
@@ -722,70 +798,107 @@ else:
             )
             
             with tab_dq:
-                # ALTERAÇÃO: Sumário DQ
                 st_dq = st.session_state.stats_dq
                 if st_dq:
                     col_d1, col_d2, col_d3 = st.columns(3)
-                    col_d1.metric("Variáveis Iniciais", st_dq["Entrada"])
-                    col_d2.metric("Eliminadas (>20% missings)", st_dq["Eliminadas"])
-                    col_d3.metric("Restantes", st_dq["Saída"])
+                    col_d1.metric("Variáveis Iniciais", format_thousands(st_dq["Entrada"]))
+                    col_d2.metric("Eliminadas (>20% missings)", format_thousands(st_dq["Eliminadas"]))
+                    col_d3.metric("Restantes", format_thousands(st_dq["Saída"]))
                 st.write("Estado das variáveis quanto a Missings (>20%):")
-                st.dataframe(st.session_state.report_dq_missings.style.apply(lambda x: ['background: #ffcccc' if v == 'Eliminar' else '' for v in x], axis=1), use_container_width=True)
+                st.dataframe(
+                    st.session_state.report_dq_missings.style
+                    .apply(lambda x: ['background: #ffcccc' if v == 'Eliminar' else '' for v in x], axis=1)
+                    .format({'Missing %': format_percent}), 
+                    use_container_width=True
+                )
             
             with tab_split:
-                st.table(st.session_state.report_split)
+                # ALTERAÇÃO: Formatação de Tabela de Split
+                st.dataframe(
+                    st.session_state.report_split.style.format({
+                        'Registos': format_thousands,
+                        'Eventos': format_thousands,
+                        'Event Rate': format_percent
+                    }),
+                    use_container_width=True
+                )
             
             with tab_uni:
-                # ALTERAÇÃO: Sumário Univariada
                 st_uni = st.session_state.stats_uni
                 if st_uni:
                     col_u1, col_u2, col_u3 = st.columns(3)
-                    col_u1.metric("Variáveis Testadas", st_uni["Entrada"])
-                    col_u2.metric("Eliminadas (p-value > 0.05)", st_uni["Eliminadas"])
-                    col_u3.metric("Restantes", st_uni["Saída"])
-                st.dataframe(st.session_state.report_uni.style.apply(lambda x: ['background: #ffcccc' if v == 'Eliminar' else '' for v in x], axis=1), use_container_width=True)
+                    col_u1.metric("Variáveis Testadas", format_thousands(st_uni["Entrada"]))
+                    col_u2.metric("Eliminadas (p-value > 0.05)", format_thousands(st_uni["Eliminadas"]))
+                    col_u3.metric("Restantes", format_thousands(st_uni["Saída"]))
+                
+                # ALTERAÇÃO: Colunas novas e formatação
+                st.dataframe(
+                    st.session_state.report_uni.style
+                    .apply(lambda x: ['background: #ffcccc' if v == 'Eliminar' else '' for v in x], axis=1)
+                    .format({'p-value': '{:.4f}', 'Valor Estatística': '{:.4f}'}), 
+                    use_container_width=True
+                )
             
             with tab_multi:
-                # ALTERAÇÃO: Sumário Multivariada
                 st_mul = st.session_state.stats_multi
                 if st_mul:
                     col_m1, col_m2, col_m3 = st.columns(3)
-                    col_m1.metric("Candidatas", st_mul["Entrada"])
-                    col_m2.metric("Eliminadas (Correlação > 0.8)", st_mul["Eliminadas"])
-                    col_m3.metric("Finais", st_mul["Saída"])
+                    col_m1.metric("Candidatas", format_thousands(st_mul["Entrada"]))
+                    col_m2.metric("Eliminadas (Correlação > 0.8)", format_thousands(st_mul["Eliminadas"]))
+                    col_m3.metric("Finais", format_thousands(st_mul["Saída"]))
                 
                 st.write("Matriz de Correlação:")
                 if 'corr_matrix' in st.session_state and st.session_state.corr_matrix is not None:
-                    # ALTERAÇÃO: Altura da Matriz
+                    # ALTERAÇÃO: Cores (Vermelho acima de ref, claro resto)
+                    # Criando escala customizada: Até 0.8 (aprox) claro, depois vermelho
+                    custom_colorscale = [
+                        [0.0, 'rgb(245,245,245)'],
+                        [0.79, 'rgb(245,245,245)'],
+                        [0.80, 'rgb(255,200,200)'],
+                        [1.0, 'rgb(200,0,0)']
+                    ]
+                    
                     fig_corr = go.Figure(data=go.Heatmap(
                         z=st.session_state.corr_matrix.values,
                         x=st.session_state.corr_matrix.columns,
                         y=st.session_state.corr_matrix.index,
-                        colorscale='Viridis'))
+                        colorscale=custom_colorscale,
+                        zmin=0, zmax=1))
                     fig_corr.update_layout(height=800)
-                    st.plotly_chart(fig_corr)
+                    st.plotly_chart(fig_corr, use_container_width=True)
                 st.divider()
                 st.write("Variáveis Eliminadas por Correlação (Critério: Kendall Tau):")
-                st.dataframe(st.session_state.report_multi_details, use_container_width=True)
+                # ALTERAÇÃO: Formatação % nas correlações e kendalls
+                st.dataframe(
+                    st.session_state.report_multi_details.style.format({
+                        "Correlação": format_percent,
+                        "Kendall Eliminada": format_percent,
+                        "Kendall Mantida": format_percent
+                    }), 
+                    use_container_width=True
+                )
             
             with tab_cat:
-                # ALTERAÇÃO: Sumário Categorização
                 st_cat = st.session_state.stats_cat
                 if st_cat:
                     col_c1, col_c2, col_c3 = st.columns(3)
-                    col_c1.metric("Tentativa Binning", st_cat["Entrada"])
-                    col_c2.metric("Falharam (Monotonicidade/Size)", st_cat["Eliminadas"])
-                    col_c3.metric("Variáveis Finais", st_cat["Saída"])
+                    col_c1.metric("Tentativa Binning", format_thousands(st_cat["Entrada"]))
+                    col_c2.metric("Falharam (Monotonicidade/Size)", format_thousands(st_cat["Eliminadas"]))
+                    col_c3.metric("Variáveis Finais", format_thousands(st_cat["Saída"]))
                 
                 st.header("Variáveis Finais (IV e Bins)")
-                st.dataframe(st.session_state.report_iv, use_container_width=True)
+                # ALTERAÇÃO: IV com 2 casas decimais
+                st.dataframe(
+                    st.session_state.report_iv.style.format({'IV': '{:.2f}', 'Nº Bins': format_thousands}), 
+                    use_container_width=True
+                )
+                
                 st.divider()
                 st.subheader("Análise Gráfica de Bins e WoE")
                 iv_vars = st.session_state.report_iv['Variável'].tolist()
                 selected_iv_var = st.selectbox("Selecione a Variável para ver detalhe:", iv_vars)
                 
                 if selected_iv_var and selected_iv_var in st.session_state.iv_tables:
-                    # CORREÇÃO: SORT BY WOE
                     df_viz = st.session_state.iv_tables[selected_iv_var].copy()
                     df_viz = df_viz.sort_values(by='WoE', ascending=True)
                     
@@ -793,10 +906,24 @@ else:
                     fig_woe.add_trace(go.Bar(x=df_viz['Value'], y=df_viz['Total'], name='Volume', marker_color='rgb(158,202,225)'), secondary_y=False)
                     fig_woe.add_trace(go.Scatter(x=df_viz['Value'], y=df_viz['WoE'], name='WoE', mode='lines+markers', line=dict(color='rgb(227,26,28)', width=3)), secondary_y=True)
                     fig_woe.update_layout(title=f"Binning & WoE: {selected_iv_var}")
-                    fig_woe.update_yaxes(title_text="Volume", secondary_y=False)
+                    fig_woe.update_yaxes(title_text="Volume", tickformat=",", secondary_y=False)
                     fig_woe.update_yaxes(title_text="Weight of Evidence (WoE)", secondary_y=True)
                     st.plotly_chart(fig_woe, use_container_width=True)
-                    st.dataframe(df_viz, use_container_width=True)
+                    
+                    # ALTERAÇÃO: Tabela de detalhe com Event Rate, formatação 2 casas e milhares
+                    st.dataframe(
+                        df_viz[['Value', 'Good', 'Bad', 'Total', 'Event_Rate', 'WoE', 'IV']]
+                        .rename(columns={'Event_Rate': 'Event Rate'})
+                        .style.format({
+                            'Good': format_thousands,
+                            'Bad': format_thousands,
+                            'Total': format_thousands,
+                            'Event Rate': format_percent, # Pedido duas casas decimais, format_percent usa .2%
+                            'WoE': '{:.2f}',
+                            'IV': '{:.2f}'
+                        }), 
+                        use_container_width=True
+                    )
 
             with tab_ml:
                 st.table(st.session_state.report_ml)
